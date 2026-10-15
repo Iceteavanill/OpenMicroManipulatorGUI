@@ -83,7 +83,7 @@ class GCodeRunner(QObject):
             if line.startswith('G4'):
                 args = parse_gcode_line(line)
                 wait_time = args.get('S', 0.1)
-                self.oms.dwell(wait_time, blocking=True, timeout=5)
+                self.oms.dwell(wait_time, blocking=True, timeout=60)
 
             if line.startswith('M82'):
                 self.extrude_relative = False
@@ -121,7 +121,7 @@ class GCodeRunner(QObject):
                                                     s[1]*self.gcode_scale_factor[1],
                                                     s[2]*self.gcode_scale_factor[2],
                                                     min(s[3]/60*self.gcode_scale_factor[3], self.max_feedrate),
-                                                    blocking=True, timeout=5)
+                                                    blocking=True, timeout=60)
                 if command_accepted:
                     self.state = s
                 else:
