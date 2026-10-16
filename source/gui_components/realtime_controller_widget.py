@@ -14,12 +14,12 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QObject, QEvent, QPoint, Signal, QMutex, QThread
 from PySide6.QtGui import QCursor, QMouseEvent
-from PySide6.QtUiTools import loadUiType
 from hardware.open_micro_stage_api import OpenMicroStageInterface
+from ui_loader import load_ui_type
 import numpy as np
 
 _ui_path = os.path.join(os.path.dirname(__file__), "realtime_controller_widget.ui")
-Ui_RealtimeControllerWidget, _ = loadUiType(_ui_path)
+Ui_RealtimeControllerWidget = load_ui_type(_ui_path)
 
 # Channel order used throughout this file: (mouse_x, mouse_y, wheel).
 # Each entry is the device axis index (0=X, 1=Y, 2=Z) that channel drives.
@@ -135,7 +135,7 @@ class RealtimeControllerWidget(QWidget, Ui_RealtimeControllerWidget):
         self.base_widget = base_widget
         self.mouse_control_active = False
         self.lowpass_strength = 0.9
-        self.update_frequency = 120 # Hz
+        self.update_frequency = 100 # Hz (each update is a serial round trip, higher rates block other commands)
         self.motion_gain = np.array( [-0.001, 0.001, -0.005], dtype=np.float32)
         self.motion_limits = np.array( [1.0, 1.0, 1.0], dtype=np.float32)
 
@@ -189,7 +189,8 @@ class RealtimeControllerWidget(QWidget, Ui_RealtimeControllerWidget):
         self.update_thread = UpdateWorker(self.oms,
                                           motion_gain=motion_gain,
                                           motion_limits=self.motion_limits,
-                                          lowpass_strength=self.lowpass_strength)
+                                          lowpass_strength=self.lowpass_strength,
+                                          update_frequency=self.update_frequency)
 
         self.update_thread.start()
 

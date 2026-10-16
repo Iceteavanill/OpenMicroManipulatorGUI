@@ -20,11 +20,10 @@ from hardware.camera_opencv import OpenCVCamera
 from hardware.device_discovery import list_camera_devices, list_serial_devices
 from hardware.open_micro_stage_api import OpenMicroStageInterface
 from image_processing.image_point_tracker import ImagePointTracker
-from optical_alignment import OpticalAlignment
+from ui_loader import load_ui_type
 from version import __version__
-from PySide6.QtCore import Qt, QSettings, QThread, Signal
+from PySide6.QtCore import Qt, QSettings, QThread, QTimer, Signal
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtUiTools import loadUiType
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -41,7 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 _ui_path = os.path.join(os.path.dirname(__file__), "mainwindow.ui")
-Ui_DeviceControlMainWindow, _ = loadUiType(_ui_path)
+Ui_DeviceControlMainWindow = load_ui_type(_ui_path)
 
 
 class CameraStreamWorker(QThread):
@@ -52,6 +51,12 @@ class CameraStreamWorker(QThread):
         super().__init__(parent)
         self.camera = camera
         self.running = True
+        # True while the GUI thread has not yet processed the last emitted frame.
+        # New frames are dropped meanwhile so they cannot pile up in the event queue.
+        self.frame_pending = False
+
+    def frame_consumed(self):
+        self.frame_pending = False
 
     def stop(self):
         self.running = False
@@ -65,6 +70,10 @@ class CameraStreamWorker(QThread):
         if not self.running:
             return False
 
+        if self.frame_pending:
+            return True  # GUI still busy with the previous frame, drop this one
+
+        self.frame_pending = True
         self.frame_ready.emit(frame)
         return True
 
@@ -74,6 +83,23 @@ class CameraStreamWorker(QThread):
         except Exception as exc:
             if self.running:
                 self.stream_error.emit(str(exc))
+
+
+class BackgroundTask(QThread):
+    """Runs a blocking function (e.g. a slow serial command) outside the GUI thread."""
+    task_done = Signal(object, object)  # (result, exception or None)
+
+    def __init__(self, function, parent=None):
+        super().__init__(parent)
+        self.function = function
+
+    def run(self):
+        try:
+            result = self.function()
+        except Exception as exc:
+            self.task_done.emit(None, exc)
+            return
+        self.task_done.emit(result, None)
 
 
 class CalibrationPlotDialog(QDialog):
@@ -117,6 +143,9 @@ class CalibrationPlotDialog(QDialog):
 
 
 class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
+    # emitted from the G-code runner thread, handled in the GUI thread
+    gcode_finished_signal = Signal()
+
     def __init__(self, oms: OpenMicroStageInterface, camera=None):
         super().__init__()
 
@@ -124,6 +153,7 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
         self.camera = camera
         self.camera_stream_worker = None
         self.gcode_runner = None
+        self.stage_task = None  # BackgroundTask while homing / calibrating / sending a path
 
         self.settings = QSettings()
         self.pixel_per_mm = 2000.0/2.2
@@ -141,7 +171,6 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
         self.feedrates = [50.0, 5.0, 5.0, 1.0, 0.1]
         self.step_size_idx = 1
         self.waypoints = []
-        self.waypoint_idx = 1000000
 
         self.image_point_tracker = ImagePointTracker()
 
@@ -194,9 +223,17 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
             button.toggled.connect(lambda _checked=False, i=tool_idx: self.apply_tool_setting(i))
             spinbox.valueChanged.connect(lambda _value=0.0, i=tool_idx: self.apply_tool_setting(i))
 
-        self.exposure_spinbox.valueChanged.connect(self.apply_camera_settings)
-        self.gain_spinbox.valueChanged.connect(self.apply_camera_settings)
-        self.white_balance_spinbox.valueChanged.connect(self.apply_camera_settings)
+        # Camera settings are applied shortly after the last change instead of on every
+        # single step, because each camera call can block for a moment.
+        self.camera_settings_timer = QTimer(self)
+        self.camera_settings_timer.setSingleShot(True)
+        self.camera_settings_timer.setInterval(250)
+        self.camera_settings_timer.timeout.connect(self.apply_camera_settings)
+        # (lambda so the spinbox value is not passed on as the timer interval)
+        for spinbox in (self.exposure_spinbox, self.gain_spinbox, self.white_balance_spinbox):
+            spinbox.valueChanged.connect(lambda _value=0.0: self.camera_settings_timer.start())
+
+        self.gcode_finished_signal.connect(self.on_gcode_runner_finished)
 
         # Step size buttons
         self.step_button_group = QButtonGroup()
@@ -222,7 +259,8 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
         self.btn_load_transform.clicked.connect(self.load_transform)
         self.btn_save_transform.clicked.connect(self.save_transform)
         self.btn_fiber_alignment.clicked.connect(self.run_fiber_alignment)
-        self.btn_calibrate_axis.clicked.connect(self.run_axis_calibration)
+        # lambda: otherwise the button's 'checked' value (False) is passed as save_result
+        self.btn_calibrate_axis.clicked.connect(lambda _checked=False: self.run_axis_calibration())
 
         # Path / GCode tab
         self.btn_add_waypoint.clicked.connect(self.add_waypoint)
@@ -297,15 +335,16 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
     def update_connection_state(self):
         stage_connected = self.oms.is_connected()
         camera_connected = self.camera is not None and self.camera.is_connected()
+        stage_busy = self.stage_task is not None
 
         for widget in self.stage_dependent_widgets:
-            widget.setEnabled(stage_connected)
+            widget.setEnabled(stage_connected and not stage_busy)
 
         for widget in self.camera_dependent_widgets:
             widget.setEnabled(camera_connected)
 
         self.serial_connect_button.setText("Close" if stage_connected else "Open")
-        self.serial_connect_button.setEnabled(stage_connected or self.serial_combo.count() > 0)
+        self.serial_connect_button.setEnabled((stage_connected or self.serial_combo.count() > 0) and not stage_busy)
         self.camera_connect_button.setText("Close" if camera_connected else "Open")
         self.camera_connect_button.setEnabled(camera_connected or self.camera_combo.count() > 0)
 
@@ -503,15 +542,20 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
         QMessageBox.critical(self, "Camera Stream Error", message)
 
     def on_frame_received(self, frame):
-        if frame is None:
-            return
+        try:
+            if frame is None:
+                return
 
-        if len(frame.shape) == 2 or (len(frame.shape) == 3 and frame.shape[2] == 1):
-            vis_img = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-        else:
-            vis_img = frame.copy()
+            if len(frame.shape) == 2 or (len(frame.shape) == 3 and frame.shape[2] == 1):
+                vis_img = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+            else:
+                vis_img = frame.copy()
 
-        self.update_controller(frame, vis_img, pixel_per_mm=self.pixel_per_mm)
+            self.update_controller(frame, vis_img, pixel_per_mm=self.pixel_per_mm)
+        finally:
+            # allow the camera thread to deliver the next frame
+            if self.camera_stream_worker is not None:
+                self.camera_stream_worker.frame_consumed()
 
     def stop_gcode_runner(self):
         if self.gcode_runner is not None:
@@ -536,11 +580,42 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
         self.oms.set_tool_output(tool_idx, value, immediate=True)
 
     def require_stage_connection(self):
-        if self.oms.is_connected():
-            return True
+        if not self.oms.is_connected():
+            QMessageBox.warning(self, "Manipulator Disconnected", "Connect a serial device before using this control.")
+            return False
 
-        QMessageBox.warning(self, "Manipulator Disconnected", "Connect a serial device before using this control.")
-        return False
+        # While a background task or the G-code runner is talking to the device, a command
+        # from the GUI thread would block the whole window until they are done.
+        if self.stage_task is not None or self.gcode_runner is not None:
+            print("Manipulator is busy, command ignored.")
+            return False
+
+        return True
+
+    def start_stage_task(self, function, on_done):
+        """
+        Runs 'function' (blocking device communication) in a background thread so the
+        window stays responsive. 'on_done(result, exception)' is called in the GUI thread.
+        Stage controls are disabled while the task runs.
+        """
+        task = BackgroundTask(function, self)
+        task.on_done = on_done
+        # connected to a method of this window, so it is executed in the GUI thread
+        task.task_done.connect(self.on_stage_task_done)
+        self.stage_task = task
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.update_connection_state()
+        task.start()
+
+    def on_stage_task_done(self, result, exc):
+        task = self.stage_task
+        self.stage_task = None
+        QApplication.restoreOverrideCursor()
+        self.update_connection_state()
+        if task is not None:
+            task.wait()
+            task.deleteLater()
+            task.on_done(result, exc)
 
     def require_camera_connection(self):
         if self.camera is not None and self.camera.is_connected():
@@ -553,6 +628,9 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
         if not self.require_stage_connection() or not self.require_camera_connection():
             return
 
+        # imported here because it loads scipy / scikit-optimize, which slows down startup
+        from optical_alignment import OpticalAlignment
+
         aligner = OpticalAlignment(self.oms, self.camera)
         pos, _ = aligner.optimize()
         self.camera.start_grabbing(False)
@@ -563,28 +641,30 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
             return
 
         num_joints = 3
-        joint_data = []
 
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
+        # runs in a background thread (takes up to 30 s per joint)
+        def calibrate_all_joints():
+            joint_data = []
             for joint_index in range(num_joints):
                 # save_result=True persists the calibration on the controller.
                 res, data = self.oms.calibrate_joint(joint_index, save_result=save_result)
                 if data and len(data) >= 3 and len(data[0]) > 0:
                     joint_data.append((joint_index, data))
-        except Exception as exc:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "Calibration Failed", f"An error occurred during calibration:\n{exc}")
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
+            return joint_data
 
-        if not joint_data:
-            QMessageBox.warning(self, "Calibration Failed", "No calibration data was returned by the controller.")
-            return
+        def on_done(joint_data, exc):
+            if exc is not None:
+                QMessageBox.critical(self, "Calibration Failed", f"An error occurred during calibration:\n{exc}")
+                return
 
-        dialog = CalibrationPlotDialog(joint_data, self)
-        dialog.show()
+            if not joint_data:
+                QMessageBox.warning(self, "Calibration Failed", "No calibration data was returned by the controller.")
+                return
+
+            dialog = CalibrationPlotDialog(joint_data, self)
+            dialog.show()
+
+        self.start_stage_task(calibrate_all_joints, on_done)
 
     def on_stop_realtime_control(self):
         if self.oms.is_connected():
@@ -596,10 +676,20 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
         if not self.require_stage_connection():
             return
 
-        self.oms.home()
-        position = self.oms.read_current_position(True)
-        if position[0] is not None:
-            self.current_pos = list(position)
+        # runs in a background thread (homing can take several seconds)
+        def home_and_read_position():
+            self.oms.home()
+            return self.oms.read_current_position(True)
+
+        def on_done(position, exc):
+            if exc is not None:
+                QMessageBox.critical(self, "Homing Failed", f"An error occurred during homing:\n{exc}")
+                return
+
+            if position is not None and position[0] is not None:
+                self.current_pos = list(position)
+
+        self.start_stage_task(home_and_read_position, on_done)
 
     def move_axis(self, axis, direction):
         if not self.require_stage_connection():
@@ -625,7 +715,28 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
         if not self.require_stage_connection():
             return
 
-        self.waypoint_idx = 0
+        if len(self.waypoints) == 0:
+            return
+
+        # Previously the path was advanced by incoming camera frames, so it only ran with
+        # a camera connected. Now all waypoints (and the return to the first one) are sent
+        # from a background thread. The device queues them and executes them in order.
+        waypoints = [(list(pos), feedrate) for pos, feedrate in self.waypoints]
+        waypoints.append(waypoints[0])
+
+        def send_path():
+            for pos, feedrate in waypoints:
+                self.oms.move_to(*pos, feedrate, timeout=60)
+                self.oms.dwell(0.1, True, timeout=60)
+            return waypoints[-1][0]
+
+        def on_done(last_pos, exc):
+            if exc is not None:
+                QMessageBox.critical(self, "Path Failed", f"An error occurred while sending the path:\n{exc}")
+                return
+            self.current_pos = list(last_pos)
+
+        self.start_stage_task(send_path, on_done)
 
     def save_path(self):
         if len(self.waypoints) <= 0:
@@ -646,6 +757,7 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("; Generated by Open Micro Manipulator Controller\n")
                 handle.write("G90 ; absolute positioning\n\n")
+                # waypoints are in mm, the G-code runner assumes micrometers without this
                 handle.write("SCALE=1\n")
 
                 for waypoint in self.waypoints:
@@ -686,14 +798,6 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
         self.step_size_idx = index
 
     def update_controller(self, frame, vis_image, pixel_per_mm):
-        if self.oms.is_connected() and self.waypoint_idx <= len(self.waypoints) and len(self.waypoints) > 0:
-            self.current_pos[:], feedrate = self.waypoints[self.waypoint_idx % len(self.waypoints)]
-            self.oms.move_to(*self.current_pos, feedrate)
-            self.oms.dwell(0.1, False)
-            self.waypoint_idx += 1
-        else:
-            self.waypoint_idx = 1000000
-
         prev_pos = self.image_point_tracker.prev_pos
         current_pos = self.image_point_tracker.update(frame)
 
@@ -763,13 +867,13 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
                 self.run_gcode_button.blockSignals(False)
                 return
 
-            self.gcode_runner = GCodeRunner(gcode, self.oms, max_feedrate=500)
+            # max_feedrate in mm/s (was 0.5, which made every G-code run very slow)
+            self.gcode_runner = GCodeRunner(gcode, self.oms, max_feedrate=5.0)
 
             def on_finished():
-                self.gcode_runner = None
-                self.run_gcode_button.blockSignals(True)
-                self.run_gcode_button.setChecked(False)
-                self.run_gcode_button.blockSignals(False)
+                # called from the runner thread: widgets must only be touched in the
+                # GUI thread, so hand over via a signal
+                self.gcode_finished_signal.emit()
 
             def on_iteration_finished():
                 pass
@@ -785,6 +889,12 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
             
         elif self.gcode_runner is not None:
             self.gcode_runner.stop()
+
+    def on_gcode_runner_finished(self):
+        self.gcode_runner = None
+        self.run_gcode_button.blockSignals(True)
+        self.run_gcode_button.setChecked(False)
+        self.run_gcode_button.blockSignals(False)
 
     def run_3point_alignment(self):
         if not self.require_stage_connection():
@@ -862,6 +972,12 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
             QMessageBox.critical(self, "Save Error", f"Failed to save transform:\n{exc}")
 
     def closeEvent(self, event: QCloseEvent):
+        if self.stage_task is not None:
+            QMessageBox.information(self, "Manipulator Busy",
+                                    "Please wait until homing / calibration / path upload has finished.")
+            event.ignore()
+            return
+
         if self.realtime_control_widget.is_running():
             self.realtime_control_widget.stop_control()
 
@@ -887,6 +1003,9 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
         cv2.imwrite(path, img)
 
     def run_spacekey_command(self):
+        if not self.require_stage_connection():
+            return
+
         self.realtime_control_widget.stop_control()
         pos = self.oms.read_current_position(True)
 

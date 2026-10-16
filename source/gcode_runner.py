@@ -83,6 +83,7 @@ class GCodeRunner(QObject):
             if line.startswith('G4'):
                 args = parse_gcode_line(line)
                 wait_time = args.get('S', 0.1)
+                # long timeout: when the device queue is full it only replies once a slot is free
                 self.oms.dwell(wait_time, blocking=True, timeout=60)
 
             if line.startswith('M82'):
