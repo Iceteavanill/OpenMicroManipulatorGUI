@@ -64,6 +64,9 @@ class SerialInterface:
         # Synchronization for blocking send/receive
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
+        # Held for the whole send/reply cycle, so only one command is on the line at a time
+        # (self._lock is released by _condition.wait() while waiting for the reply).
+        self._command_lock = threading.Lock()
         self._waiting_for_response = False
         self._response_string = ""
         self._response_status = None
@@ -194,6 +197,13 @@ class SerialInterface:
         :param timeout: Maximum time to wait for response.
         :return: Tuple containing Status enum (OK | ERROR | TIMEOUT), and response lines.
         """
+        # Several threads send commands (GUI, G-code runner, realtime control, position
+        # display). Without this lock a second command could be sent while the first one
+        # still waits for its reply, and the replies got mixed up.
+        with self._command_lock:
+            return self._send_command(cmd, timeout)
+
+    def _send_command(self, cmd: str, timeout) -> tuple[ReplyStatus, str]:
         with self._lock:
             if not self.serial or not self.serial.is_open:
                 return SerialInterface.ReplyStatus.ERROR, 'Serial not open'
@@ -214,6 +224,10 @@ class SerialInterface:
             # Wait for completion
             end_time = time.time() + timeout
             while self._response_status is None:
+                if self._stop_event.is_set():
+                    # connection was closed while waiting (see close())
+                    self._waiting_for_response = False
+                    return SerialInterface.ReplyStatus.ERROR, 'Serial closed'
                 remaining = end_time - time.time()
                 if remaining <= 0:
                     self._waiting_for_response = False
@@ -228,6 +242,9 @@ class SerialInterface:
     def close(self):
         """Closes the serial port."""
         self._stop_event.set()
+        # wake up a command that is still waiting for its reply, so it returns immediately
+        with self._condition:
+            self._condition.notify_all()
         if self.serial and self.serial.is_open:
             self.serial.close()
         self.serial = None
@@ -474,6 +491,39 @@ class OpenMicroStageInterface:
             transformed = self.workspace_transform_inv @ np.array([float(x), float(y), float(z), 1.0])
             x, y, z = transformed[:3] / transformed[3]
 
+        return float(x), float(y), float(z)
+
+    def read_target_and_measured_position(self, timeout_s=60):
+        """
+        Reads the live target position (current servo setpoint) and the measured position
+        (computed from the encoders) in device coordinates [mm], WITHOUT the workspace
+        transform (see machine_to_workspace()). Requires firmware command M54.
+        :return: (status, target, measured) where target / measured are (x, y, z) tuples,
+                 or None if not available.
+        """
+        serial_interface = self.serial
+        if serial_interface is None:
+            return SerialInterface.ReplyStatus.ERROR, None, None
+
+        res, response = serial_interface.send_command("M54", timeout_s)
+        if res != SerialInterface.ReplyStatus.OK:
+            return res, None, None
+
+        positions = {}
+        for line in response.splitlines():
+            match = re.match(
+                r"([TM])\s+X([-+]?\d*\.?\d+)\s+Y([-+]?\d*\.?\d+)\s+Z([-+]?\d*\.?\d+)",
+                line.strip()
+            )
+            if match:
+                positions[match.group(1)] = tuple(float(v) for v in match.groups()[1:])
+
+        return res, positions.get("T"), positions.get("M")
+
+    def machine_to_workspace(self, position):
+        """Converts a position from device coordinates into workspace coordinates."""
+        transformed = self.workspace_transform_inv @ np.array([position[0], position[1], position[2], 1.0])
+        x, y, z = transformed[:3] / transformed[3]
         return float(x), float(y), float(z)
 
     def read_encoder_angles(self):

@@ -7,6 +7,7 @@
 
 import json
 import os
+import time
 from datetime import datetime
 
 import cv2
@@ -18,7 +19,7 @@ from gui_components.realtime_controller_widget import RealtimeControllerWidget
 from hardware.camera_basler import BaslerCamera
 from hardware.camera_opencv import OpenCVCamera
 from hardware.device_discovery import list_camera_devices, list_serial_devices
-from hardware.open_micro_stage_api import OpenMicroStageInterface
+from hardware.open_micro_stage_api import OpenMicroStageInterface, SerialInterface
 from image_processing.image_point_tracker import ImagePointTracker
 from ui_loader import load_ui_type
 from version import __version__
@@ -31,6 +32,8 @@ from PySide6.QtWidgets import (
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
+    QGridLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -102,6 +105,47 @@ class BackgroundTask(QThread):
         self.task_done.emit(result, None)
 
 
+class PositionPollWorker(QThread):
+    """
+    Periodically reads target and measured position (firmware command M54) in a
+    background thread. While another command is in progress (homing, G-code, ...) the
+    read simply waits for its turn, so the GUI thread is never blocked.
+    """
+    position_updated = Signal(object, object)  # (target, measured) in device coordinates, or None
+    unsupported = Signal()                     # firmware does not answer M54
+
+    def __init__(self, oms, interval_s=0.2, parent=None):
+        super().__init__(parent)
+        self.oms = oms
+        self.interval_s = interval_s
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+    def run(self):
+        # Probe with a short timeout: firmware without M54 does not reply at all.
+        res, target, measured = self.oms.read_target_and_measured_position(timeout_s=2)
+        if not self.running:
+            return
+        if res != SerialInterface.ReplyStatus.OK:
+            self.unsupported.emit()
+            return
+        self.position_updated.emit(target, measured)
+
+        while self.running and self.oms.is_connected():
+            deadline = time.monotonic() + self.interval_s
+            while self.running and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if not self.running:
+                break
+
+            # long timeout: the device answers late while a queued move blocks its input
+            res, target, measured = self.oms.read_target_and_measured_position(timeout_s=60)
+            if self.running and res == SerialInterface.ReplyStatus.OK:
+                self.position_updated.emit(target, measured)
+
+
 class CalibrationPlotDialog(QDialog):
     """Shows the raw encoder counts over motor angle for each calibrated joint.
 
@@ -154,6 +198,7 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
         self.camera_stream_worker = None
         self.gcode_runner = None
         self.stage_task = None  # BackgroundTask while homing / calibrating / sending a path
+        self.position_poll_worker = None
 
         self.settings = QSettings()
         self.pixel_per_mm = 2000.0/2.2
@@ -195,6 +240,7 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
         self.setWindowTitle(f"{self.windowTitle()}  v{__version__}")
 
         self.video_viewer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.create_position_display()
 
         # Connect signals – connection buttons
         self.serial_refresh_button.clicked.connect(self.refresh_serial_devices)
@@ -278,6 +324,104 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
 
         self.main_tabs.setCurrentIndex(0)
         self.update_waypoint_info()
+
+    def create_position_display(self):
+        """
+        Position display at the top of the control panel: live target and measured
+        position, in workspace and in device (machine) coordinates, in µm.
+        """
+        display = QFrame(self.device_controls_frame)
+        display.setObjectName("position_display")
+        grid = QGridLayout(display)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(2)
+
+        right = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        small_style = "font-size: 10pt;"
+        value_style = 'font-size: 10pt; font-family: "Consolas", "Courier New", monospace;'
+
+        self.position_title_label = QLabel("Position [µm]", display)
+        grid.addWidget(self.position_title_label, 0, 0, 1, 2)
+        for col, axis in enumerate(("X", "Y", "Z"), start=2):
+            axis_label = QLabel(axis, display)
+            axis_label.setAlignment(right)
+            grid.addWidget(axis_label, 0, col)
+
+        # (key, frame text, kind text) - frame text only on the first row of each block
+        rows = [
+            ("workspace_target", "Workspace", "target"),
+            ("workspace_measured", "", "measured"),
+            ("machine_target", "Machine", "target"),
+            ("machine_measured", "", "measured"),
+        ]
+        self.position_value_labels = {}
+        for row, (key, frame_text, kind_text) in enumerate(rows, start=1):
+            for col, text in ((0, frame_text), (1, kind_text)):
+                label = QLabel(text, display)
+                label.setStyleSheet(small_style)
+                grid.addWidget(label, row, col)
+
+            labels = []
+            for col in range(2, 5):
+                value_label = QLabel("–", display)
+                value_label.setAlignment(right)
+                value_label.setStyleSheet(value_style)
+                value_label.ensurePolished()
+                # fixed width so the layout does not jump when the number of digits changes
+                value_label.setMinimumWidth(value_label.fontMetrics().horizontalAdvance("-00000.0") + 4)
+                grid.addWidget(value_label, row, col)
+                labels.append(value_label)
+            self.position_value_labels[key] = labels
+
+        grid.setColumnStretch(1, 1)
+
+        # first item of the control panel, above the "Micro-Manipulator Controls" heading
+        self.device_controls_layout.insertWidget(0, display)
+        self.position_display = display
+
+    def set_position_values(self, key, position):
+        for label, value in zip(self.position_value_labels[key], position or (None,) * 3):
+            label.setText("–" if value is None else f"{value * 1000.0:.1f}")
+
+    def clear_position_display(self, title="Position [µm]"):
+        self.position_title_label.setText(title)
+        for key in self.position_value_labels:
+            self.set_position_values(key, None)
+
+    def on_position_updated(self, target, measured):
+        if self.position_poll_worker is None or self.sender() is not self.position_poll_worker:
+            return  # late update from a worker of a previous connection
+
+        self.set_position_values("machine_target", target)
+        self.set_position_values("machine_measured", measured)
+        self.set_position_values("workspace_target",
+                                 self.oms.machine_to_workspace(target) if target else None)
+        self.set_position_values("workspace_measured",
+                                 self.oms.machine_to_workspace(measured) if measured else None)
+
+    def on_position_unsupported(self):
+        if self.position_poll_worker is None or self.sender() is not self.position_poll_worker:
+            return
+        self.clear_position_display("Position: needs firmware with M54")
+
+    def start_position_polling(self):
+        self.stop_position_polling()
+        self.clear_position_display()
+        worker = PositionPollWorker(self.oms, interval_s=0.2, parent=self)
+        worker.position_updated.connect(self.on_position_updated)
+        worker.unsupported.connect(self.on_position_unsupported)
+        worker.finished.connect(worker.deleteLater)
+        self.position_poll_worker = worker
+        worker.start()
+
+    def stop_position_polling(self):
+        """Asks the polling thread to stop (without waiting) and returns it, or None."""
+        worker = self.position_poll_worker
+        self.position_poll_worker = None
+        if worker is not None:
+            worker.stop()
+        return worker
 
     def register_stage_widget(self, widget):
         self.stage_dependent_widgets.append(widget)
@@ -402,13 +546,18 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
         for tool_idx, _, _ in self.tool_controls:
             self.apply_tool_setting(tool_idx)
         self.update_connection_state()
+        self.start_position_polling()
 
     def disconnect_stage(self):
         if self.realtime_control_widget.is_running():
             self.realtime_control_widget.stop_control()
 
         self.stop_gcode_runner()
-        self.oms.disconnect()
+        poll_worker = self.stop_position_polling()
+        self.oms.disconnect()  # also wakes up a position request that is still waiting
+        if poll_worker is not None:
+            poll_worker.wait(1000)
+        self.clear_position_display()
         self.connected_stage_label = None
         self.current_pos = [0, 0, 0]
         self.update_connection_state()
@@ -676,9 +825,19 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
         if not self.require_stage_connection():
             return
 
+        home_return_feedrate = 2.0  # mm/s, for the move from the end stops to zero
+
         # runs in a background thread (homing can take several seconds)
-        def home_and_read_position():
-            self.oms.home()
+        def home_and_move_to_zero():
+            res = self.oms.home()
+            if res != SerialInterface.ReplyStatus.OK:
+                raise RuntimeError(f"The device did not finish homing (reply: {res.name}).")
+
+            # Move from the end stops to machine zero (the neutral centre of the device),
+            # independent of Set Origin. move_to() expects workspace coordinates.
+            zero = self.oms.machine_to_workspace((0.0, 0.0, 0.0))
+            self.oms.move_to(*zero, home_return_feedrate, timeout=60)
+            self.oms.wait_for_stop()
             return self.oms.read_current_position(True)
 
         def on_done(position, exc):
@@ -689,11 +848,26 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
             if position is not None and position[0] is not None:
                 self.current_pos = list(position)
 
-        self.start_stage_task(home_and_read_position, on_done)
+        self.start_stage_task(home_and_move_to_zero, on_done)
+
+    def sync_current_pos(self):
+        """
+        Takes over the position the device is commanded to (end of all queued moves, in
+        workspace coordinates), so jogging and waypoints continue from where G-code, paths
+        or mouse control left the manipulator instead of from an outdated GUI value.
+        """
+        try:
+            position = self.oms.read_current_position(True)
+        except ValueError:
+            return
+        if position[0] is not None:
+            self.current_pos = list(position)
 
     def move_axis(self, axis, direction):
         if not self.require_stage_connection():
             return
+
+        self.sync_current_pos()
 
         flipped = (1, 1, 1)
         d = self.step_sizes[self.step_size_idx]
@@ -707,6 +881,8 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
 
         if self.realtime_control_widget.is_running():
             self.current_pos[:] = self.realtime_control_widget.get_current_pose()
+        else:
+            self.sync_current_pos()
 
         self.waypoints.append([self.current_pos.copy(), self.feedrates[self.step_size_idx]])
         self.update_waypoint_info()
