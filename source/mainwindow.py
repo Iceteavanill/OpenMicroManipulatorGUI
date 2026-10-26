@@ -518,7 +518,7 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
             self.connect_selected_camera()
 
     def connect_selected_stage(self):
-        if self.oms.is_connected():
+        if self.oms.is_connected() or self.stage_task is not None:
             return
 
         device = self.serial_combo.currentData()
@@ -527,15 +527,26 @@ class DeviceControlMainWindow(QMainWindow, Ui_DeviceControlMainWindow):
             return
 
         port = device["port"]
-        if not self.oms.connect(port):
-            QMessageBox.critical(self, "Connection Failed", f"Failed to connect to serial device:\n{port}")
-            self.connected_stage_label = None
-            self.update_connection_state()
-            return
 
-        self.connected_stage_label = device["label"]
-        self.settings.setValue("Connections/last_stage_id", device["id"])
-        self.on_stage_connected()
+        def on_done(connected, exc):
+            if exc is not None or not connected:
+                message = f"Failed to connect to serial device:\n{port}"
+                if exc is not None:
+                    message += f"\n\n{exc}"
+                else:
+                    message += "\n\nThe device did not answer like the manipulator firmware. Is this the right port?"
+                QMessageBox.critical(self, "Connection Failed", message)
+                self.connected_stage_label = None
+                self.update_connection_state()
+                return
+
+            self.connected_stage_label = device["label"]
+            self.settings.setValue("Connections/last_stage_id", device["id"])
+            self.on_stage_connected()
+
+        # Opening the port and checking the firmware version runs in the background: on a
+        # wrong port this can take several seconds and must not freeze the window.
+        self.start_stage_task(lambda: self.oms.connect(port), on_done)
 
     def on_stage_connected(self):
         position = self.oms.read_current_position(True)

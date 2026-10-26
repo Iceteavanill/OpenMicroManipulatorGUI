@@ -93,7 +93,9 @@ class SerialInterface:
         print(f"[SerialInterface] Connecting to port '{self.port}'...", end='')
         while time.time() < deadline:
             try:
-                self.serial = serial.Serial(self.port, self.baud_rate, timeout=2)
+                # write_timeout: on a port whose device does not take data (wrong device,
+                # Bluetooth port without connection) a write would otherwise block forever
+                self.serial = serial.Serial(self.port, self.baud_rate, timeout=2, write_timeout=1)
                 print(f" [OK]")
                 print(Style.RESET_ALL, end='')
                 return True
@@ -217,9 +219,14 @@ class SerialInterface:
             cmd = (cmd.strip() + "\n")
             self.command_msg_callback(cmd, None, '')
 
-            # Send command
-            self.serial.write(cmd.encode('ascii'))
-            self.serial.flush()
+            # Send command (no flush(): it waits without timeout until the device has taken
+            # the data, write() already returns once the data is sent or the timeout expired)
+            try:
+                self.serial.write(cmd.encode('ascii'))
+            except (serial.SerialException, OSError) as e:
+                self._waiting_for_response = False
+                print(Fore.MAGENTA + f"[SerialInterface] Sending failed: {e}" + Style.RESET_ALL)
+                return SerialInterface.ReplyStatus.ERROR, f'Sending failed: {e}'
 
             # Wait for completion
             end_time = time.time() + timeout
